@@ -9,12 +9,14 @@ use gpui::*;
 use serde::{Deserialize, Serialize};
 
 use super::{VelotypeConfigDirs, read_recent_files};
+use crate::components::single_line_input::{InputChanged, SingleLineInput, SingleLineOverflow};
 use crate::components::{
     ShortcutCategory, ShortcutCommand, ShortcutDefinition, install_keybindings,
     normalize_shortcut_config, normalize_shortcut_keys, resolved_shortcut_keys,
     shortcut_conflict_for, shortcut_definitions, switch::Switch,
 };
-use crate::i18n::{I18nManager, language_id_for_locale_preferences};
+use crate::fonts::{FontPreferences, FontSettings, FontStackParseError};
+use crate::i18n::{I18nManager, I18nStrings, language_id_for_locale_preferences};
 use crate::theme::{Theme, ThemeCatalogEntry, ThemeManager};
 use crate::window_chrome::{
     custom_titlebar_height, render_custom_titlebar, velotype_window_options,
@@ -117,6 +119,7 @@ pub(crate) struct AppPreferences {
     pub(crate) image_paste_behavior: ImagePasteBehavior,
     pub(crate) keybindings: BTreeMap<String, Vec<String>>,
     pub(crate) status_bar: StatusBarPreferences,
+    pub(crate) fonts: FontPreferences,
 }
 
 impl Default for AppPreferences {
@@ -129,6 +132,7 @@ impl Default for AppPreferences {
             image_paste_behavior: ImagePasteBehavior::None,
             keybindings: BTreeMap::new(),
             status_bar: StatusBarPreferences::default(),
+            fonts: FontPreferences::default(),
         }
     }
 }
@@ -228,6 +232,24 @@ struct PreferencesFile {
     editor: EditorPreferencesFile,
     status_bar: StatusBarPreferencesFile,
     keybindings: BTreeMap<String, Vec<String>>,
+    fonts: FontPreferencesFile,
+}
+
+#[derive(Serialize)]
+struct FontPreferencesFile {
+    body_stack: String,
+    code_stack: String,
+    ui_stack: String,
+}
+
+impl From<&FontPreferences> for FontPreferencesFile {
+    fn from(value: &FontPreferences) -> Self {
+        Self {
+            body_stack: value.body_stack.clone(),
+            code_stack: value.code_stack.clone(),
+            ui_stack: value.ui_stack.clone(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -293,6 +315,7 @@ impl From<&AppPreferences> for PreferencesFile {
             },
             status_bar: StatusBarPreferencesFile::from(&value.status_bar),
             keybindings: normalize_shortcut_config(&value.keybindings),
+            fonts: FontPreferencesFile::from(&value.fonts),
         }
     }
 }
@@ -435,6 +458,21 @@ fn app_preferences_from_toml_value(
         })
         .unwrap_or_default();
 
+    let default_fonts = FontPreferences::default();
+    let font_value = |key: &str, fallback: &str| {
+        value
+            .get("fonts")
+            .and_then(|fonts| fonts.get(key))
+            .and_then(|value| value.as_str())
+            .unwrap_or(fallback)
+            .to_string()
+    };
+    let fonts = FontPreferences {
+        body_stack: font_value("body_stack", &default_fonts.body_stack),
+        code_stack: font_value("code_stack", &default_fonts.code_stack),
+        ui_stack: font_value("ui_stack", &default_fonts.ui_stack),
+    };
+
     AppPreferences {
         startup_open,
         default_language_id,
@@ -443,6 +481,7 @@ fn app_preferences_from_toml_value(
         image_paste_behavior,
         keybindings,
         status_bar,
+        fonts,
     }
 }
 
@@ -569,6 +608,7 @@ pub(crate) fn save_preferences_from_window(
     image_paste_behavior: ImagePasteBehavior,
     keybindings: BTreeMap<String, Vec<String>>,
     status_bar: &StatusBarPreferences,
+    fonts: &FontPreferences,
 ) -> anyhow::Result<AppPreferences> {
     let dirs = VelotypeConfigDirs::from_system()?;
     save_preferences_from_window_with_dirs(
@@ -577,6 +617,7 @@ pub(crate) fn save_preferences_from_window(
         image_paste_behavior,
         keybindings,
         status_bar,
+        fonts,
         &dirs,
     )
 }
@@ -587,6 +628,7 @@ fn save_preferences_from_window_with_dirs(
     image_paste_behavior: ImagePasteBehavior,
     keybindings: BTreeMap<String, Vec<String>>,
     status_bar: &StatusBarPreferences,
+    fonts: &FontPreferences,
     dirs: &VelotypeConfigDirs,
 ) -> anyhow::Result<AppPreferences> {
     let mut preferences =
@@ -596,6 +638,7 @@ fn save_preferences_from_window_with_dirs(
     preferences.image_paste_behavior = image_paste_behavior;
     preferences.keybindings = normalize_shortcut_config(&keybindings);
     preferences.status_bar = status_bar.clone();
+    preferences.fonts = fonts.clone();
     save_app_preferences_with_dirs(&preferences, dirs)?;
     Ok(preferences)
 }
@@ -646,6 +689,11 @@ pub(crate) struct PreferencesWindow {
     saved_status_bar_show_cursor_position: bool,
     saved_status_bar_show_sidebar_toggle: bool,
     saved_status_bar_show_mode_switch: bool,
+    fonts: FontPreferences,
+    saved_fonts: FontPreferences,
+    body_font_input: Entity<SingleLineInput>,
+    code_font_input: Entity<SingleLineInput>,
+    ui_font_input: Entity<SingleLineInput>,
 }
 
 impl PreferencesWindow {
@@ -665,6 +713,34 @@ impl PreferencesWindow {
         let startup_open = preferences.startup_open;
         let image_paste_behavior = preferences.image_paste_behavior;
         let keybindings = preferences.keybindings;
+        let fonts = preferences.fonts.clone();
+        let body_font_input = cx.new(|cx| {
+            SingleLineInput::new(fonts.body_stack.clone(), "e.g. .SystemUIFont", cx)
+                .with_overflow(SingleLineOverflow::Ellipsis)
+        });
+        let code_font_input = cx.new(|cx| {
+            SingleLineInput::new(fonts.code_stack.clone(), "e.g. Consolas, monospace", cx)
+                .with_overflow(SingleLineOverflow::Ellipsis)
+        });
+        let ui_font_input = cx.new(|cx| {
+            SingleLineInput::new(fonts.ui_stack.clone(), "e.g. .SystemUIFont", cx)
+                .with_overflow(SingleLineOverflow::Ellipsis)
+        });
+        cx.subscribe(&body_font_input, |this, input, _: &InputChanged, cx| {
+            this.fonts.body_stack = input.read(cx).value().to_string();
+            cx.notify();
+        })
+        .detach();
+        cx.subscribe(&code_font_input, |this, input, _: &InputChanged, cx| {
+            this.fonts.code_stack = input.read(cx).value().to_string();
+            cx.notify();
+        })
+        .detach();
+        cx.subscribe(&ui_font_input, |this, input, _: &InputChanged, cx| {
+            this.fonts.ui_stack = input.read(cx).value().to_string();
+            cx.notify();
+        })
+        .detach();
         Self {
             nav: PreferencesNav::File,
             startup_open,
@@ -692,7 +768,32 @@ impl PreferencesWindow {
             saved_status_bar_show_cursor_position: preferences.status_bar.show_cursor_position,
             saved_status_bar_show_sidebar_toggle: preferences.status_bar.show_sidebar_toggle,
             saved_status_bar_show_mode_switch: preferences.status_bar.show_mode_switch,
+            fonts: fonts.clone(),
+            saved_fonts: fonts,
+            body_font_input,
+            code_font_input,
+            ui_font_input,
         }
+    }
+
+    fn font_validation_error(&self, strings: &I18nStrings) -> Option<String> {
+        [
+            (&strings.preferences_font_body, &self.fonts.body_stack),
+            (&strings.preferences_font_code, &self.fonts.code_stack),
+            (&strings.preferences_font_ui, &self.fonts.ui_stack),
+        ]
+        .into_iter()
+        .find_map(|(label, value)| {
+            crate::fonts::parse_font_stack(value).err().map(|error| {
+                let message = match error {
+                    FontStackParseError::Empty => &strings.preferences_font_error_empty,
+                    FontStackParseError::UnterminatedQuote => {
+                        &strings.preferences_font_error_unterminated_quote
+                    }
+                };
+                format!("{label}: {message}")
+            })
+        })
     }
 
     fn selected_theme_name(&self) -> String {
@@ -714,6 +815,7 @@ impl PreferencesWindow {
             || self.status_bar_show_cursor_position != self.saved_status_bar_show_cursor_position
             || self.status_bar_show_sidebar_toggle != self.saved_status_bar_show_sidebar_toggle
             || self.status_bar_show_mode_switch != self.saved_status_bar_show_mode_switch
+            || self.fonts != self.saved_fonts
     }
 
     fn set_nav_file(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -802,6 +904,12 @@ impl PreferencesWindow {
             return;
         }
 
+        let strings = cx.global::<I18nManager>().strings();
+        if self.font_validation_error(strings).is_some() {
+            cx.notify();
+            return;
+        }
+
         let preferences = match save_preferences_from_window(
             self.startup_open,
             &self.selected_theme_id,
@@ -815,6 +923,7 @@ impl PreferencesWindow {
                 show_mode_switch: self.status_bar_show_mode_switch,
                 custom_buttons: Vec::new(),
             },
+            &self.fonts,
         ) {
             Ok(preferences) => preferences,
             Err(err) => {
@@ -863,6 +972,8 @@ impl PreferencesWindow {
             settings.status_bar_settings.status_bar_show_mode_switch =
                 preferences.status_bar.show_mode_switch;
         });
+        FontSettings::update(cx, preferences.fonts.clone())
+            .expect("saved font stacks were validated");
         cx.refresh_windows();
         window.activate_window();
         self.focus_handle.focus(window);
@@ -875,6 +986,7 @@ impl PreferencesWindow {
         self.saved_status_bar_show_cursor_position = self.status_bar_show_cursor_position;
         self.saved_status_bar_show_sidebar_toggle = self.status_bar_show_sidebar_toggle;
         self.saved_status_bar_show_mode_switch = self.status_bar_show_mode_switch;
+        self.saved_fonts = self.fonts.clone();
         cx.notify();
     }
 
@@ -1103,7 +1215,84 @@ impl PreferencesWindow {
             }
             dropdown = dropdown.child(list);
         }
-        self.labeled_row(&strings.preferences_local_theme, dropdown, theme)
+        let c = &theme.colors;
+        let t = &theme.typography;
+        let available = cx.text_system().all_font_names();
+        let font_error = self.font_validation_error(strings);
+        let resolved = font_error.is_none().then(|| {
+            FontSettings::resolve(self.fonts.clone(), &available, std::env::consts::OS)
+                .expect("font stacks were validated")
+        });
+        let warning = |uses_system_default: bool| {
+            if !uses_system_default {
+                div().into_any_element()
+            } else {
+                div()
+                    .w(px(360.))
+                    .text_size(px((t.dialog_body_size - 2.).max(10.)))
+                    .text_color(c.callout_warning_border)
+                    .child(strings.preferences_font_unavailable_template.clone())
+                    .into_any_element()
+            }
+        };
+        let fields = div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(self.labeled_row(
+                &strings.preferences_font_body,
+                self.body_font_input.clone(),
+                theme,
+            ))
+            .child(warning(
+                resolved
+                    .as_ref()
+                    .is_some_and(|r| r.body.uses_system_default),
+            ))
+            .child(self.labeled_row(
+                &strings.preferences_font_code,
+                self.code_font_input.clone(),
+                theme,
+            ))
+            .child(warning(
+                resolved
+                    .as_ref()
+                    .is_some_and(|r| r.code.uses_system_default),
+            ))
+            .child(self.labeled_row(
+                &strings.preferences_font_ui,
+                self.ui_font_input.clone(),
+                theme,
+            ))
+            .child(warning(
+                resolved.as_ref().is_some_and(|r| r.ui.uses_system_default),
+            ))
+            .when_some(font_error, |this, error| {
+                this.child(
+                    div()
+                        .w(px(360.))
+                        .text_size(px(t.dialog_body_size))
+                        .text_color(c.dialog_danger_button_bg)
+                        .child(error),
+                )
+            });
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(18.))
+            .child(self.labeled_row(&strings.preferences_local_theme, dropdown, theme))
+            .child(
+                div()
+                    .w(px(360.))
+                    .text_size(px((t.dialog_body_size - 2.).max(10.)))
+                    .text_color(c.dialog_muted)
+                    .child(strings.preferences_font_help.clone()),
+            )
+            .child(fields)
     }
 
     fn image_paste_behavior_label(
@@ -1680,6 +1869,7 @@ impl Render for PreferencesWindow {
             .on_key_down(cx.listener(Self::capture_shortcut_key))
             .bg(c.editor_background)
             .text_color(c.dialog_body)
+            .font(FontSettings::current(cx).ui.font())
             .child(
                 div()
                     .w(relative(0.3))
@@ -1891,6 +2081,7 @@ impl Render for PreferencesWindow {
             .size_full()
             .relative()
             .bg(c.editor_background)
+            .font(FontSettings::current(cx).ui.font())
             .child(content);
 
         if let Some(titlebar) = render_custom_titlebar(
@@ -1961,6 +2152,7 @@ mod tests {
         save_app_preferences_with_dirs, save_preferences_from_window_with_dirs,
     };
     use crate::config::VelotypeConfigDirs;
+    use crate::fonts::FontPreferences;
     use crate::i18n::I18nManager;
     use crate::theme::{ThemeCatalogEntry, ThemeManager};
     use gpui::TestAppContext;
@@ -2078,6 +2270,11 @@ mod tests {
             image_paste_behavior: ImagePasteBehavior::CopyToAssetsFolder,
             keybindings: BTreeMap::new(),
             status_bar: StatusBarPreferences::default(),
+            fonts: FontPreferences {
+                body_stack: "Segoe UI, sans-serif".into(),
+                code_stack: "Consolas, monospace".into(),
+                ui_stack: ".SystemUIFont".into(),
+            },
         };
 
         save_app_preferences_with_dirs(&preferences, &dirs)
@@ -2092,6 +2289,8 @@ mod tests {
         assert!(text.contains("default_theme_id = \"velotype-light\""));
         assert!(text.contains("show_table_headers = false"));
         assert!(text.contains("image_paste_behavior = \"copy_to_assets_folder\""));
+        assert!(text.contains("[fonts]"));
+        assert!(text.contains("body_stack = \"Segoe UI, sans-serif\""));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2162,6 +2361,7 @@ mod tests {
             image_paste_behavior: ImagePasteBehavior::None,
             keybindings: BTreeMap::new(),
             status_bar: StatusBarPreferences::default(),
+            fonts: FontPreferences::default(),
         };
         save_app_preferences_with_dirs(&preferences, &dirs)
             .expect("preferences should save to config.toml");
@@ -2172,6 +2372,7 @@ mod tests {
             ImagePasteBehavior::CopyToNamedAssetsFolder,
             BTreeMap::from([("save_document".to_string(), vec!["ctrl-alt-s".to_string()])]),
             &StatusBarPreferences::default(),
+            &FontPreferences::default(),
             &dirs,
         )
         .expect("window preferences should save");
@@ -2253,6 +2454,45 @@ mod tests {
                 assert!(preferences.has_unsaved_changes());
             })
             .expect("preferences window should be updateable");
+    }
+
+    #[gpui::test]
+    async fn font_input_changes_update_the_preferences_draft(cx: &mut TestAppContext) {
+        init_preferences_test_app(cx);
+        let handle = cx.update(|cx| {
+            open_preferences_window_with_state(
+                cx,
+                AppPreferences::default(),
+                default_theme_options(),
+                "Preferences".into(),
+            )
+        });
+        cx.run_until_parked();
+        let input = handle
+            .update(cx, |preferences, _window, _cx| {
+                preferences.body_font_input.clone()
+            })
+            .expect("preferences window should be updateable");
+        input.update(cx, |input, cx| input.set_value("Georgia, serif", cx));
+        cx.run_until_parked();
+        handle
+            .update(cx, |preferences, _window, _cx| {
+                assert_eq!(preferences.fonts.body_stack, "Georgia, serif");
+                assert!(preferences.has_unsaved_changes());
+            })
+            .expect("preferences window should be updateable");
+
+        input.update(cx, |input, cx| input.set_value("", cx));
+        cx.run_until_parked();
+        handle
+            .update(cx, |preferences, _window, cx| {
+                let strings = cx.global::<I18nManager>().strings();
+                assert_eq!(
+                    preferences.font_validation_error(strings).as_deref(),
+                    Some("Body font: Enter at least one font family.")
+                );
+            })
+            .expect("preferences window should expose live font validation");
     }
 
     #[gpui::test]
