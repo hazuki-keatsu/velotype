@@ -278,17 +278,25 @@ impl SingleLineInput {
         if !self.focus.is_focused(window) {
             return;
         }
-        let delta_x = event.delta.pixel_delta(window.line_height()).x;
-        if delta_x.is_zero() {
+        let delta = event.delta.pixel_delta(window.line_height());
+        let delta_x = f32::from(delta.x);
+        let delta_y = f32::from(delta.y);
+        if !should_handle_horizontal_scroll(
+            delta_x,
+            delta_y,
+            f32::from(self.content_width),
+            f32::from(self.viewport_width),
+        ) {
             return;
         }
         self.viewport_offset = px(clamp_viewport_offset(
-            f32::from(self.viewport_offset) + f32::from(delta_x),
+            f32::from(self.viewport_offset) + delta_x,
             f32::from(self.content_width),
             f32::from(self.viewport_width),
         ));
-        // A deliberate horizontal gesture owns this event; vertical gestures
-        // keep bubbling to the preferences page.
+        // A deliberate, overflowing horizontal gesture owns this event.
+        // Vertical gestures (including their small trackpad x jitter) bubble
+        // to the preferences page.
         cx.stop_propagation();
         cx.notify();
     }
@@ -715,6 +723,15 @@ fn cursor_visible_offset(
     clamp_viewport_offset(target, content_width, viewport_width)
 }
 
+fn should_handle_horizontal_scroll(
+    delta_x: f32,
+    delta_y: f32,
+    content_width: f32,
+    viewport_width: f32,
+) -> bool {
+    content_width > viewport_width && delta_x.abs() > delta_y.abs()
+}
+
 fn fitting_grapheme_end(text: &str, available_width: Pixels, line: &ShapedLine) -> usize {
     fitting_grapheme_end_by(text, |end| line.x_for_index(end) <= available_width)
 }
@@ -759,6 +776,7 @@ mod tests {
     use super::{
         FADE_GRAPHEME_COUNT, SingleLineOverflow, clamp_source_index, clamp_viewport_offset,
         cursor_visible_offset, fade_segments, fitting_grapheme_end_by,
+        should_handle_horizontal_scroll,
     };
     use gpui::{AppContext as _, TestAppContext};
     use unicode_segmentation::UnicodeSegmentation as _;
@@ -832,6 +850,13 @@ mod tests {
         assert_eq!(cursor_visible_offset(50.0, 40.0, 300.0, 100.0), 40.0);
         assert_eq!(cursor_visible_offset(50.0, 180.0, 300.0, 100.0), 82.0);
         assert_eq!(cursor_visible_offset(150.0, 299.0, 300.0, 100.0), 200.0);
+    }
+
+    #[test]
+    fn horizontal_scroll_leaves_vertical_and_non_overflowing_inputs_to_the_page() {
+        assert!(!should_handle_horizontal_scroll(0.5, 12.0, 300.0, 100.0));
+        assert!(!should_handle_horizontal_scroll(12.0, 0.0, 100.0, 100.0));
+        assert!(should_handle_horizontal_scroll(12.0, 0.5, 300.0, 100.0));
     }
 
     #[gpui::test]

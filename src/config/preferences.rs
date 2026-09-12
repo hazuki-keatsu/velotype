@@ -661,6 +661,20 @@ enum PreferencesNav {
     StatusBar,
 }
 
+fn font_uses_system_default(fonts: &FontPreferences, available: &[String]) -> [bool; 3] {
+    FontSettings::resolve(fonts.clone(), available, std::env::consts::OS)
+        .map(|resolved| {
+            [
+                resolved.body.uses_system_default,
+                resolved.code.uses_system_default,
+                resolved.ui.uses_system_default,
+            ]
+        })
+        // Invalid drafts show the validation error instead of availability
+        // warnings, matching the previous rendering behavior.
+        .unwrap_or([false; 3])
+}
+
 /// Independent preferences window view.
 pub(crate) struct PreferencesWindow {
     nav: PreferencesNav,
@@ -691,6 +705,8 @@ pub(crate) struct PreferencesWindow {
     saved_status_bar_show_mode_switch: bool,
     fonts: FontPreferences,
     saved_fonts: FontPreferences,
+    available_font_names: Vec<String>,
+    font_uses_system_default: [bool; 3],
     body_font_input: Entity<SingleLineInput>,
     code_font_input: Entity<SingleLineInput>,
     ui_font_input: Entity<SingleLineInput>,
@@ -714,6 +730,10 @@ impl PreferencesWindow {
         let image_paste_behavior = preferences.image_paste_behavior;
         let keybindings = preferences.keybindings;
         let fonts = preferences.fonts.clone();
+        // Querying CoreText's full font collection is expensive on macOS. Keep
+        // it out of the render path so scrolling this page stays lightweight.
+        let available_font_names = cx.text_system().all_font_names();
+        let font_uses_system_default = font_uses_system_default(&fonts, &available_font_names);
         let body_font_input = cx.new(|cx| {
             SingleLineInput::new(fonts.body_stack.clone(), "e.g. .SystemUIFont", cx)
                 .with_overflow(SingleLineOverflow::Ellipsis)
@@ -728,16 +748,19 @@ impl PreferencesWindow {
         });
         cx.subscribe(&body_font_input, |this, input, _: &InputChanged, cx| {
             this.fonts.body_stack = input.read(cx).value().to_string();
+            this.refresh_font_availability();
             cx.notify();
         })
         .detach();
         cx.subscribe(&code_font_input, |this, input, _: &InputChanged, cx| {
             this.fonts.code_stack = input.read(cx).value().to_string();
+            this.refresh_font_availability();
             cx.notify();
         })
         .detach();
         cx.subscribe(&ui_font_input, |this, input, _: &InputChanged, cx| {
             this.fonts.ui_stack = input.read(cx).value().to_string();
+            this.refresh_font_availability();
             cx.notify();
         })
         .detach();
@@ -770,6 +793,8 @@ impl PreferencesWindow {
             saved_status_bar_show_mode_switch: preferences.status_bar.show_mode_switch,
             fonts: fonts.clone(),
             saved_fonts: fonts,
+            available_font_names,
+            font_uses_system_default,
             body_font_input,
             code_font_input,
             ui_font_input,
@@ -794,6 +819,11 @@ impl PreferencesWindow {
                 format!("{label}: {message}")
             })
         })
+    }
+
+    fn refresh_font_availability(&mut self) {
+        self.font_uses_system_default =
+            font_uses_system_default(&self.fonts, &self.available_font_names);
     }
 
     fn selected_theme_name(&self) -> String {
@@ -1046,7 +1076,8 @@ impl PreferencesWindow {
         let d = &theme.dimensions;
         let t = &theme.typography;
         div()
-            .w(px(280.0))
+            .w_full()
+            .min_w(px(0.0))
             .min_h(px(36.0))
             .px(px(12.0))
             .flex()
@@ -1078,7 +1109,8 @@ impl PreferencesWindow {
         let d = &theme.dimensions;
         let t = &theme.typography;
         div()
-            .w(px(280.0))
+            .w_full()
+            .min_w(px(0.0))
             .min_h(px(30.0))
             .px(px(12.0))
             .flex()
@@ -1102,19 +1134,21 @@ impl PreferencesWindow {
         let c = &theme.colors;
         let t = &theme.typography;
         div()
+            .w_full()
+            .min_w(px(0.0))
             .flex()
             .flex_col()
-            .items_center()
             .gap(px(8.0))
             .child(
                 div()
-                    .w(px(280.0))
+                    .w_full()
+                    .min_w(px(0.0))
                     .text_size(px(t.dialog_body_size))
                     .font_weight(t.dialog_button_weight.to_font_weight())
                     .text_color(c.dialog_title)
                     .child(SharedString::from(label.to_string())),
             )
-            .child(control)
+            .child(div().w_full().min_w(px(0.0)).child(control))
     }
 
     fn render_startup_page(
@@ -1130,6 +1164,8 @@ impl PreferencesWindow {
             }
         };
         let mut dropdown = div()
+            .w_full()
+            .min_w(px(0.0))
             .flex()
             .flex_col()
             .gap(px(4.0))
@@ -1177,8 +1213,10 @@ impl PreferencesWindow {
         theme: &Theme,
         strings: &crate::i18n::I18nStrings,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> impl IntoElement {
         let mut dropdown = div()
+            .w_full()
+            .min_w(px(0.0))
             .flex()
             .flex_col()
             .gap(px(4.0))
@@ -1192,6 +1230,8 @@ impl PreferencesWindow {
         if self.theme_dropdown_open {
             let mut list = div()
                 .id("preferences-theme-dropdown-list")
+                .w_full()
+                .min_w(px(0.0))
                 .flex()
                 .flex_col()
                 .gap(px(4.0))
@@ -1217,18 +1257,14 @@ impl PreferencesWindow {
         }
         let c = &theme.colors;
         let t = &theme.typography;
-        let available = cx.text_system().all_font_names();
         let font_error = self.font_validation_error(strings);
-        let resolved = font_error.is_none().then(|| {
-            FontSettings::resolve(self.fonts.clone(), &available, std::env::consts::OS)
-                .expect("font stacks were validated")
-        });
         let warning = |uses_system_default: bool| {
             if !uses_system_default {
                 div().into_any_element()
             } else {
                 div()
-                    .w(px(360.))
+                    .w_full()
+                    .min_w(px(0.0))
                     .text_size(px((t.dialog_body_size - 2.).max(10.)))
                     .text_color(c.callout_warning_border)
                     .child(strings.preferences_font_unavailable_template.clone())
@@ -1247,9 +1283,7 @@ impl PreferencesWindow {
                 theme,
             ))
             .child(warning(
-                resolved
-                    .as_ref()
-                    .is_some_and(|r| r.body.uses_system_default),
+                font_error.is_none() && self.font_uses_system_default[0],
             ))
             .child(self.labeled_row(
                 &strings.preferences_font_code,
@@ -1257,9 +1291,7 @@ impl PreferencesWindow {
                 theme,
             ))
             .child(warning(
-                resolved
-                    .as_ref()
-                    .is_some_and(|r| r.code.uses_system_default),
+                font_error.is_none() && self.font_uses_system_default[1],
             ))
             .child(self.labeled_row(
                 &strings.preferences_font_ui,
@@ -1267,27 +1299,35 @@ impl PreferencesWindow {
                 theme,
             ))
             .child(warning(
-                resolved.as_ref().is_some_and(|r| r.ui.uses_system_default),
+                font_error.is_none() && self.font_uses_system_default[2],
             ))
             .when_some(font_error, |this, error| {
                 this.child(
                     div()
-                        .w(px(360.))
+                        .w_full()
+                        .min_w(px(0.0))
                         .text_size(px(t.dialog_body_size))
                         .text_color(c.dialog_danger_button_bg)
                         .child(error),
                 )
             });
         div()
+            .id("preferences-theme-scroll")
             .w_full()
+            .h_full()
+            .flex_1()
+            .min_h(px(0.0))
+            .min_w(px(0.0))
+            .overflow_y_scroll()
             .flex()
             .flex_col()
-            .items_center()
             .gap(px(18.))
+            .pr(px(4.0))
             .child(self.labeled_row(&strings.preferences_local_theme, dropdown, theme))
             .child(
                 div()
-                    .w(px(360.))
+                    .w_full()
+                    .min_w(px(0.0))
                     .text_size(px((t.dialog_body_size - 2.).max(10.)))
                     .text_color(c.dialog_muted)
                     .child(strings.preferences_font_help.clone()),
@@ -1982,9 +2022,6 @@ impl Render for PreferencesWindow {
                                     .w_full()
                                     .flex_1()
                                     .min_h(px(0.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
                                     .child(self.render_theme_page(&theme, &strings, cx))
                                     .into_any_element(),
                                 PreferencesNav::Image => div()
