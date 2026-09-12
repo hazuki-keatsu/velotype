@@ -15,7 +15,7 @@ use crate::components::{
     normalize_shortcut_config, normalize_shortcut_keys, resolved_shortcut_keys,
     shortcut_conflict_for, shortcut_definitions, switch::Switch,
 };
-use crate::fonts::{FontPreferences, FontSettings, FontStackParseError};
+use crate::fonts::{FontCatalog, FontPreferences, FontSettings, FontStackParseError};
 use crate::i18n::{I18nManager, I18nStrings, language_id_for_locale_preferences};
 use crate::theme::{Theme, ThemeCatalogEntry, ThemeManager};
 use crate::window_chrome::{
@@ -460,12 +460,16 @@ fn app_preferences_from_toml_value(
 
     let default_fonts = FontPreferences::default();
     let font_value = |key: &str, fallback: &str| {
-        value
+        let candidate = value
             .get("fonts")
             .and_then(|fonts| fonts.get(key))
             .and_then(|value| value.as_str())
-            .unwrap_or(fallback)
-            .to_string()
+            .unwrap_or(fallback);
+        if crate::fonts::parse_font_stack(candidate).is_ok() {
+            candidate.to_string()
+        } else {
+            fallback.to_string()
+        }
     };
     let fonts = FontPreferences {
         body_stack: font_value("body_stack", &default_fonts.body_stack),
@@ -661,18 +665,15 @@ enum PreferencesNav {
     StatusBar,
 }
 
-fn font_uses_system_default(fonts: &FontPreferences, available: &[String]) -> [bool; 3] {
-    FontSettings::resolve(fonts.clone(), available, std::env::consts::OS)
-        .map(|resolved| {
-            [
-                resolved.body.uses_system_default,
-                resolved.code.uses_system_default,
-                resolved.ui.uses_system_default,
-            ]
-        })
-        // Invalid drafts show the validation error instead of availability
-        // warnings, matching the previous rendering behavior.
-        .unwrap_or([false; 3])
+fn font_uses_system_default(fonts: &FontPreferences, catalog: &FontCatalog) -> [bool; 3] {
+    [
+        FontSettings::stack_uses_system_default(&fonts.body_stack, catalog, std::env::consts::OS)
+            .unwrap_or(false),
+        FontSettings::stack_uses_system_default(&fonts.code_stack, catalog, std::env::consts::OS)
+            .unwrap_or(false),
+        FontSettings::stack_uses_system_default(&fonts.ui_stack, catalog, std::env::consts::OS)
+            .unwrap_or(false),
+    ]
 }
 
 /// Independent preferences window view.
@@ -705,7 +706,7 @@ pub(crate) struct PreferencesWindow {
     saved_status_bar_show_mode_switch: bool,
     fonts: FontPreferences,
     saved_fonts: FontPreferences,
-    available_font_names: Vec<String>,
+    font_catalog: FontCatalog,
     font_uses_system_default: [bool; 3],
     body_font_input: Entity<SingleLineInput>,
     code_font_input: Entity<SingleLineInput>,
@@ -730,10 +731,8 @@ impl PreferencesWindow {
         let image_paste_behavior = preferences.image_paste_behavior;
         let keybindings = preferences.keybindings;
         let fonts = preferences.fonts.clone();
-        // Querying CoreText's full font collection is expensive on macOS. Keep
-        // it out of the render path so scrolling this page stays lightweight.
-        let available_font_names = cx.text_system().all_font_names();
-        let font_uses_system_default = font_uses_system_default(&fonts, &available_font_names);
+        let font_catalog = FontCatalog::current(cx);
+        let font_uses_system_default = font_uses_system_default(&fonts, &font_catalog);
         let body_font_input = cx.new(|cx| {
             SingleLineInput::new(fonts.body_stack.clone(), "e.g. .SystemUIFont", cx)
                 .with_overflow(SingleLineOverflow::Ellipsis)
@@ -748,19 +747,19 @@ impl PreferencesWindow {
         });
         cx.subscribe(&body_font_input, |this, input, _: &InputChanged, cx| {
             this.fonts.body_stack = input.read(cx).value().to_string();
-            this.refresh_font_availability();
+            this.refresh_font_availability(0);
             cx.notify();
         })
         .detach();
         cx.subscribe(&code_font_input, |this, input, _: &InputChanged, cx| {
             this.fonts.code_stack = input.read(cx).value().to_string();
-            this.refresh_font_availability();
+            this.refresh_font_availability(1);
             cx.notify();
         })
         .detach();
         cx.subscribe(&ui_font_input, |this, input, _: &InputChanged, cx| {
             this.fonts.ui_stack = input.read(cx).value().to_string();
-            this.refresh_font_availability();
+            this.refresh_font_availability(2);
             cx.notify();
         })
         .detach();
@@ -793,7 +792,7 @@ impl PreferencesWindow {
             saved_status_bar_show_mode_switch: preferences.status_bar.show_mode_switch,
             fonts: fonts.clone(),
             saved_fonts: fonts,
-            available_font_names,
+            font_catalog,
             font_uses_system_default,
             body_font_input,
             code_font_input,
@@ -821,9 +820,19 @@ impl PreferencesWindow {
         })
     }
 
-    fn refresh_font_availability(&mut self) {
-        self.font_uses_system_default =
-            font_uses_system_default(&self.fonts, &self.available_font_names);
+    fn refresh_font_availability(&mut self, index: usize) {
+        let input = match index {
+            0 => &self.fonts.body_stack,
+            1 => &self.fonts.code_stack,
+            2 => &self.fonts.ui_stack,
+            _ => return,
+        };
+        self.font_uses_system_default[index] = FontSettings::stack_uses_system_default(
+            input,
+            &self.font_catalog,
+            std::env::consts::OS,
+        )
+        .unwrap_or(false);
     }
 
     fn selected_theme_name(&self) -> String {
@@ -1234,9 +1243,7 @@ impl PreferencesWindow {
                 .min_w(px(0.0))
                 .flex()
                 .flex_col()
-                .gap(px(4.0))
-                .max_h(px(240.0))
-                .overflow_y_scroll();
+                .gap(px(4.0));
 
             for (index, entry) in self.theme_options.clone().into_iter().enumerate() {
                 let selected = entry.id == self.selected_theme_id;
@@ -1366,6 +1373,8 @@ impl PreferencesWindow {
             ImagePasteBehavior::CopyToNamedAssetsFolder,
         ];
         let mut dropdown = div()
+            .w_full()
+            .min_w(px(0.0))
             .flex()
             .flex_col()
             .gap(px(4.0))
@@ -1909,7 +1918,7 @@ impl Render for PreferencesWindow {
             .on_key_down(cx.listener(Self::capture_shortcut_key))
             .bg(c.editor_background)
             .text_color(c.dialog_body)
-            .font(FontSettings::current(cx).ui.font())
+            .font(FontSettings::ui_font(cx))
             .child(
                 div()
                     .w(relative(0.3))
@@ -2010,12 +2019,14 @@ impl Render for PreferencesWindow {
                             )
                             .child(match self.nav {
                                 PreferencesNav::File => div()
+                                    .id("preferences-file-scroll")
                                     .w_full()
+                                    .h_full()
                                     .flex_1()
                                     .min_h(px(0.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
+                                    .min_w(px(0.0))
+                                    .overflow_y_scroll()
+                                    .pr(px(4.0))
                                     .child(self.render_startup_page(&theme, &strings, cx))
                                     .into_any_element(),
                                 PreferencesNav::Theme => div()
@@ -2025,12 +2036,14 @@ impl Render for PreferencesWindow {
                                     .child(self.render_theme_page(&theme, &strings, cx))
                                     .into_any_element(),
                                 PreferencesNav::Image => div()
+                                    .id("preferences-image-scroll")
                                     .w_full()
+                                    .h_full()
                                     .flex_1()
                                     .min_h(px(0.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
+                                    .min_w(px(0.0))
+                                    .overflow_y_scroll()
+                                    .pr(px(4.0))
                                     .child(self.render_image_page(&theme, &strings, cx))
                                     .into_any_element(),
                                 PreferencesNav::Shortcuts => div()
@@ -2118,7 +2131,7 @@ impl Render for PreferencesWindow {
             .size_full()
             .relative()
             .bg(c.editor_background)
-            .font(FontSettings::current(cx).ui.font())
+            .font(FontSettings::ui_font(cx))
             .child(content);
 
         if let Some(titlebar) = render_custom_titlebar(
@@ -2250,6 +2263,35 @@ mod tests {
         assert_eq!(preferences.default_language_id, "en-US");
         assert_eq!(preferences.default_theme_id, "velotype-light");
         assert_eq!(preferences.image_paste_behavior, ImagePasteBehavior::None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_font_stacks_fall_back_independently() {
+        let root = std::env::temp_dir().join(format!(
+            "velotype-preferences-invalid-font-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root should exist");
+        let dirs = VelotypeConfigDirs::from_root(&root);
+        std::fs::write(
+            dirs.app_config_file(),
+            r#"
+                [fonts]
+                body_stack = "Georgia, serif"
+                code_stack = ""
+                ui_stack = "Inter, sans-serif"
+            "#,
+        )
+        .expect("preferences should be written");
+
+        let preferences = read_app_preferences_with_dirs(&dirs).expect("preferences should load");
+        assert_eq!(preferences.fonts.body_stack, "Georgia, serif");
+        assert_eq!(
+            preferences.fonts.code_stack,
+            FontPreferences::default().code_stack
+        );
+        assert_eq!(preferences.fonts.ui_stack, "Inter, sans-serif");
         let _ = std::fs::remove_dir_all(root);
     }
 

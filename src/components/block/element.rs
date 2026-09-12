@@ -933,7 +933,7 @@ impl Element for BlockTextElement {
                     theme.colors.text_link,
                     theme.colors.code_bg,
                     show_inline_code_backgrounds,
-                    &crate::fonts::FontSettings::current(cx).code.font(),
+                    &crate::fonts::FontSettings::code_font(cx),
                 )
             }
         } else {

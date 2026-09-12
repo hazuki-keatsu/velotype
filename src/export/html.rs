@@ -12,7 +12,7 @@ use crate::components::{
     parse_html_image_block, parse_mermaid_fence_source, parse_mermaid_fence_start,
     render_latex_to_svg, render_mermaid_to_svg, sanitize_html_for_export,
 };
-use crate::fonts::{FontPreferences, FontSettings};
+use crate::fonts::{FontCatalog, FontPreferences, FontSettings};
 use crate::net;
 use crate::theme::{FontWeightDef, Theme};
 
@@ -972,7 +972,7 @@ fn chromium_pdf_theme_css(theme: &Theme, fonts: &FontSettings) -> String {
 fn default_font_settings() -> FontSettings {
     FontSettings::resolve(
         FontPreferences::default(),
-        &[".SystemUIFont".into()],
+        &FontCatalog::from_names(vec![".SystemUIFont".into()]),
         std::env::consts::OS,
     )
     .expect("default export font stacks are valid")
@@ -1036,7 +1036,7 @@ mod tests {
         contains_tibetan_text, render_chromium_pdf_html_with_base_dir_and_fonts, render_html,
         render_html_with_base_dir,
     };
-    use crate::fonts::{FontPreferences, FontSettings, SYSTEM_UI_FONT};
+    use crate::fonts::{FontCatalog, FontPreferences, FontSettings, SYSTEM_UI_FONT};
     use crate::theme::Theme;
     use std::fs;
     use uuid::Uuid;
@@ -1063,7 +1063,7 @@ mod tests {
                 code_stack: "'Code \\\"Family', monospace".into(),
                 ui_stack: ".SystemUIFont".into(),
             },
-            &[],
+            &FontCatalog::from_names(Vec::new()),
             "windows",
         )
         .unwrap();
@@ -1074,8 +1074,8 @@ mod tests {
             None,
             &fonts,
         );
-        assert!(html.contains("font-family: \"Body Family\", \"Segoe UI\", \"Arial\""));
-        assert!(html.contains("font-family: \"Code \\\"Family\", \"Cascadia Mono\""));
+        assert!(html.contains("font-family: \"Body Family\", sans-serif"));
+        assert!(html.contains("font-family: \"Code \\\"Family\", monospace"));
         assert!(!html.contains("Code \"Family"));
     }
     #[test]
@@ -1129,7 +1129,7 @@ mod tests {
     fn chromium_pdf_light_theme_clears_print_container_frames() {
         let fonts = FontSettings::resolve(
             FontPreferences::default(),
-            &[SYSTEM_UI_FONT.into()],
+            &FontCatalog::from_names(vec![SYSTEM_UI_FONT.into()]),
             std::env::consts::OS,
         )
         .expect("default font stacks are valid");

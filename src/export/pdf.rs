@@ -158,14 +158,14 @@ impl Drop for PdfTempFiles {
 mod tests {
     use super::{chromium_pdf_params, file_url_from_path, render_pdf_with_fonts};
     use crate::export::html::render_chromium_pdf_html_with_base_dir_and_fonts;
-    use crate::fonts::{FontPreferences, FontSettings, SYSTEM_UI_FONT};
+    use crate::fonts::{FontCatalog, FontPreferences, FontSettings, SYSTEM_UI_FONT};
     use crate::theme::Theme;
 
     #[test]
     fn chromium_pdf_html_uses_print_layout_and_preserves_resources() {
         let fonts = FontSettings::resolve(
             FontPreferences::default(),
-            &[SYSTEM_UI_FONT.into()],
+            &FontCatalog::from_names(vec![SYSTEM_UI_FONT.into()]),
             std::env::consts::OS,
         )
         .expect("default font stacks are valid");
@@ -211,7 +211,7 @@ mod tests {
     fn render_pdf_reports_actionable_error_without_chromium() {
         let fonts = FontSettings::resolve(
             FontPreferences::default(),
-            &[SYSTEM_UI_FONT.into()],
+            &FontCatalog::from_names(vec![SYSTEM_UI_FONT.into()]),
             std::env::consts::OS,
         )
         .expect("default font stacks are valid");

@@ -1,13 +1,48 @@
 //! User-configurable system font stacks shared by native rendering and export.
 
 use gpui::{App, Font, FontFallbacks, Global, font};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 pub(crate) const SYSTEM_UI_FONT: &str = ".SystemUIFont";
 pub(crate) const DEFAULT_BODY_STACK: &str = ".SystemUIFont";
 pub(crate) const DEFAULT_UI_STACK: &str = ".SystemUIFont";
 pub(crate) const DEFAULT_CODE_STACK: &str =
     "SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace";
+
+#[derive(Clone, Debug)]
+pub(crate) struct FontCatalog {
+    families: Arc<HashMap<String, String>>,
+}
+
+impl Global for FontCatalog {}
+
+impl FontCatalog {
+    pub(crate) fn from_names(names: impl IntoIterator<Item = String>) -> Self {
+        let mut families = HashMap::new();
+        for name in names {
+            families.entry(name.to_lowercase()).or_insert(name);
+        }
+        families
+            .entry(SYSTEM_UI_FONT.to_lowercase())
+            .or_insert_with(|| SYSTEM_UI_FONT.to_string());
+        Self {
+            families: Arc::new(families),
+        }
+    }
+
+    fn canonical_name(&self, family: &str) -> Option<&str> {
+        self.families
+            .get(&family.to_lowercase())
+            .map(String::as_str)
+    }
+
+    pub(crate) fn current(cx: &App) -> Self {
+        cx.try_global::<Self>()
+            .cloned()
+            .unwrap_or_else(|| Self::from_names(std::iter::once(SYSTEM_UI_FONT.to_string())))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FontPreferences {
@@ -83,10 +118,6 @@ pub(crate) fn parse_font_stack(input: &str) -> Result<Vec<String>, FontStackPars
     push_family(&mut families, &mut current);
 
     let mut seen = HashSet::new();
-    // TODO: Something needed to remind.
-    // This is the logic for deduplicating fonts regardless of case; it will only keep the first font name entered.
-    // So there might be a potential bug here: if the user enters the font name with the wrong case, the specified font might not be found.
-    // But this should count as the user's own input issue, so I won't implement complex handling logic and will leave it up to the user to deal with.
     families.retain(|family| seen.insert(family.to_lowercase()));
     if families.is_empty() {
         Err(FontStackParseError::Empty)
@@ -137,6 +168,14 @@ pub(crate) fn tibetan_font_families(target_os: &str) -> &'static [&'static str] 
     }
 }
 
+const CSS_TIBETAN_FONT_FAMILIES: &[&str] = &[
+    "Noto Serif Tibetan",
+    "Noto Sans Tibetan",
+    "Microsoft Himalaya",
+    "Kailasa",
+    "BabelStone Tibetan",
+];
+
 fn expand_generics(families: &[String], target_os: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut seen = HashSet::new();
@@ -156,32 +195,30 @@ fn expand_generics(families: &[String], target_os: &str) -> Vec<String> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedFontStack {
-    pub native_families: Vec<String>,
+    #[cfg(test)]
+    native_families: Vec<String>,
     /// True when none of the user-provided families can be used locally.
     /// The renderer will then use its built-in fallback chain, ending in the
     /// system UI font.
     pub uses_system_default: bool,
     css_families: Vec<String>,
+    native_font: Font,
 }
 
 impl ResolvedFontStack {
     fn resolve(
         input: &str,
-        available: &[String],
+        catalog: &FontCatalog,
         target_os: &str,
         tibetan: bool,
     ) -> Result<Self, FontStackParseError> {
         let requested = parse_font_stack(input)?;
         let expanded = expand_generics(&requested, target_os);
-        let available = available
-            .iter()
-            .map(|name| name.to_lowercase())
-            .collect::<HashSet<_>>();
         let mut native_families = Vec::new();
         let mut has_available_requested_family = false;
         for family in &expanded {
-            if family == SYSTEM_UI_FONT || available.contains(&family.to_lowercase()) {
-                push_unique(&mut native_families, family);
+            if let Some(canonical) = catalog.canonical_name(family) {
+                push_unique(&mut native_families, canonical);
                 has_available_requested_family = true;
             } else {
                 // A missing entry is normal for a cross-platform font stack.
@@ -192,45 +229,41 @@ impl ResolvedFontStack {
         if !has_available_requested_family {
             push_unique(&mut native_families, SYSTEM_UI_FONT);
         }
-        let mut css_families = expanded;
+        let mut css_families = requested;
         if tibetan {
             for family in tibetan_font_families(target_os) {
-                if available.contains(&family.to_lowercase()) {
-                    push_unique(&mut native_families, family);
+                if let Some(canonical) = catalog.canonical_name(family) {
+                    push_unique(&mut native_families, canonical);
                 }
+            }
+            for family in CSS_TIBETAN_FONT_FAMILIES {
                 push_unique(&mut css_families, family);
             }
         }
         push_unique(&mut native_families, SYSTEM_UI_FONT);
         push_unique(&mut css_families, SYSTEM_UI_FONT);
+        let native_font = native_font(&native_families);
         Ok(Self {
+            #[cfg(test)]
             native_families,
             uses_system_default: !has_available_requested_family,
             css_families,
+            native_font,
         })
     }
 
     pub(crate) fn font(&self) -> Font {
-        let mut result = font(
-            self.native_families
-                .first()
-                .cloned()
-                .unwrap_or_else(|| SYSTEM_UI_FONT.into()),
-        );
-        if self.native_families.len() > 1 {
-            result.fallbacks = Some(FontFallbacks::from_fonts(
-                self.native_families[1..].to_vec(),
-            ));
-        }
-        result
+        self.native_font.clone()
     }
 
     pub(crate) fn css_font_family(&self) -> String {
         self.css_families
             .iter()
             .map(|family| {
-                if family == SYSTEM_UI_FONT {
+                if family.eq_ignore_ascii_case(SYSTEM_UI_FONT) {
                     "system-ui".to_string()
+                } else if is_css_generic_family(family) {
+                    family.to_ascii_lowercase()
                 } else {
                     css_quote_family(family)
                 }
@@ -238,6 +271,26 @@ impl ResolvedFontStack {
             .collect::<Vec<_>>()
             .join(", ")
     }
+}
+
+fn native_font(families: &[String]) -> Font {
+    let mut result = font(
+        families
+            .first()
+            .cloned()
+            .unwrap_or_else(|| SYSTEM_UI_FONT.into()),
+    );
+    if families.len() > 1 {
+        result.fallbacks = Some(FontFallbacks::from_fonts(families[1..].to_vec()));
+    }
+    result
+}
+
+fn is_css_generic_family(family: &str) -> bool {
+    matches!(
+        family.to_ascii_lowercase().as_str(),
+        "serif" | "sans-serif" | "monospace"
+    )
 }
 
 fn push_unique(values: &mut Vec<String>, value: &str) {
@@ -275,25 +328,34 @@ pub(crate) struct FontSettings {
 impl Global for FontSettings {}
 
 impl FontSettings {
+    pub(crate) fn stack_uses_system_default(
+        input: &str,
+        catalog: &FontCatalog,
+        target_os: &str,
+    ) -> Result<bool, FontStackParseError> {
+        Ok(ResolvedFontStack::resolve(input, catalog, target_os, true)?.uses_system_default)
+    }
+
     pub(crate) fn resolve(
         preferences: FontPreferences,
-        available: &[String],
+        catalog: &FontCatalog,
         target_os: &str,
     ) -> Result<Self, FontStackParseError> {
         Ok(Self {
-            body: ResolvedFontStack::resolve(&preferences.body_stack, available, target_os, true)?,
-            code: ResolvedFontStack::resolve(&preferences.code_stack, available, target_os, true)?,
-            ui: ResolvedFontStack::resolve(&preferences.ui_stack, available, target_os, true)?,
+            body: ResolvedFontStack::resolve(&preferences.body_stack, catalog, target_os, true)?,
+            code: ResolvedFontStack::resolve(&preferences.code_stack, catalog, target_os, true)?,
+            ui: ResolvedFontStack::resolve(&preferences.ui_stack, catalog, target_os, true)?,
         })
     }
 
     pub(crate) fn init(cx: &mut App, preferences: FontPreferences) {
-        let available = cx.text_system().all_font_names();
+        let catalog = FontCatalog::from_names(cx.text_system().all_font_names());
         let settings =
-            Self::resolve(preferences, &available, std::env::consts::OS).unwrap_or_else(|_| {
-                Self::resolve(FontPreferences::default(), &available, std::env::consts::OS)
+            Self::resolve(preferences, &catalog, std::env::consts::OS).unwrap_or_else(|_| {
+                Self::resolve(FontPreferences::default(), &catalog, std::env::consts::OS)
                     .expect("default font stacks are valid")
             });
+        cx.set_global(catalog);
         cx.set_global(settings);
     }
 
@@ -301,11 +363,8 @@ impl FontSettings {
         cx: &mut App,
         preferences: FontPreferences,
     ) -> Result<(), FontStackParseError> {
-        let settings = Self::resolve(
-            preferences,
-            &cx.text_system().all_font_names(),
-            std::env::consts::OS,
-        )?;
+        let catalog = FontCatalog::current(cx);
+        let settings = Self::resolve(preferences, &catalog, std::env::consts::OS)?;
         cx.set_global(settings);
         Ok(())
     }
@@ -314,11 +373,32 @@ impl FontSettings {
         cx.try_global::<Self>().cloned().unwrap_or_else(|| {
             Self::resolve(
                 FontPreferences::default(),
-                &[SYSTEM_UI_FONT.into()],
+                &FontCatalog::current(cx),
                 std::env::consts::OS,
             )
             .expect("default font stacks are valid")
         })
+    }
+
+    pub(crate) fn body_font(cx: &App) -> Font {
+        Self::current_stack_font(cx, |settings| &settings.body)
+    }
+
+    pub(crate) fn code_font(cx: &App) -> Font {
+        Self::current_stack_font(cx, |settings| &settings.code)
+    }
+
+    pub(crate) fn ui_font(cx: &App) -> Font {
+        Self::current_stack_font(cx, |settings| &settings.ui)
+    }
+
+    fn current_stack_font(cx: &App, select: impl FnOnce(&Self) -> &ResolvedFontStack) -> Font {
+        if let Some(settings) = cx.try_global::<Self>() {
+            select(settings).font()
+        } else {
+            let fallback = Self::current(cx);
+            select(&fallback).font()
+        }
     }
 }
 
@@ -345,21 +425,21 @@ mod tests {
 
     #[test]
     fn resolves_generics_and_only_uses_system_default_when_none_are_available() {
-        let available = vec![
+        let catalog = FontCatalog::from_names(vec![
             "Segoe UI".into(),
             "Arial".into(),
             "Microsoft Himalaya".into(),
             SYSTEM_UI_FONT.into(),
-        ];
+        ]);
         let stack =
-            ResolvedFontStack::resolve("Missing, sans-serif", &available, "windows", true).unwrap();
+            ResolvedFontStack::resolve("Missing, sans-serif", &catalog, "windows", true).unwrap();
         assert!(!stack.uses_system_default);
         assert_eq!(&stack.native_families[..2], &["Segoe UI", "Arial"]);
         assert_eq!(stack.native_families.last().unwrap(), SYSTEM_UI_FONT);
         assert!(stack.css_font_family().contains("\"Missing\""));
 
         let missing_only =
-            ResolvedFontStack::resolve("Missing", &available, "windows", true).unwrap();
+            ResolvedFontStack::resolve("Missing", &catalog, "windows", true).unwrap();
         assert!(missing_only.uses_system_default);
         assert_eq!(
             missing_only.native_families.first().unwrap(),
@@ -373,13 +453,48 @@ mod tests {
 
     #[test]
     fn css_serialization_escapes_user_controlled_names() {
-        let stack =
-            ResolvedFontStack::resolve("'A\\\"; color:red;/*</style>'", &[], "linux", false)
-                .unwrap();
+        let stack = ResolvedFontStack::resolve(
+            "'A\\\"; color:red;/*</style>'",
+            &FontCatalog::from_names(Vec::new()),
+            "linux",
+            false,
+        )
+        .unwrap();
         let css = stack.css_font_family();
         assert!(css.starts_with("\"A\\\"; color:red;/*"));
         assert!(css.contains("\\3c /style\\3e "));
         assert!(!css.contains("</style>"));
         assert!(css.ends_with("system-ui"));
+    }
+
+    #[test]
+    fn css_preserves_generic_families_for_cross_platform_fallback() {
+        let stack = ResolvedFontStack::resolve(
+            "Local Code, monospace",
+            &FontCatalog::from_names(vec!["Local Code".into()]),
+            "macos",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            stack.css_font_family(),
+            "\"Local Code\", monospace, system-ui"
+        );
+    }
+
+    #[test]
+    fn catalog_restores_the_installed_fonts_canonical_name() {
+        let stack = ResolvedFontStack::resolve(
+            "iNtEr",
+            &FontCatalog::from_names(vec!["Inter".into()]),
+            "linux",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            stack.native_families.first().map(String::as_str),
+            Some("Inter")
+        );
+        assert_eq!(stack.font().family.to_string(), "Inter");
     }
 }

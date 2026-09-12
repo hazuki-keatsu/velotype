@@ -1905,7 +1905,7 @@ impl Render for Editor {
             .min_w(px(0.0))
             .bg(theme.colors.editor_background)
             .relative()
-            .font(FontSettings::current(cx).body.font())
+            .font(FontSettings::body_font(cx))
             .child(scroll_content);
 
         let content_area = if show_custom_scrollbar {
@@ -1992,7 +1992,7 @@ impl Render for Editor {
             .flex_col()
             .relative()
             .bg(theme.colors.editor_background)
-            .font(FontSettings::current(cx).ui.font())
+            .font(FontSettings::ui_font(cx))
             .on_modifiers_changed(move |event, window, _| {
                 if event.modifiers.secondary() != follow_modifier_active {
                     window.refresh();
